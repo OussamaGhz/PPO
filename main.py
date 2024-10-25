@@ -14,23 +14,25 @@ class SimpleBandwidthEnv(gym.Env):
         self.cir = cir
         self.num_users = 10
         self.current_step = 0
+        self.abusive_counters = np.zeros(self.num_users)
 
         # Define action and observation spaces
         self.action_space = spaces.Box(
             low=cir, high=total_bandwidth, shape=(self.num_users,), dtype=np.float32
         )
         self.observation_space = spaces.Box(
-            low=0, high=np.inf, shape=(self.num_users, 2), dtype=np.float32
+            low=0, high=np.inf, shape=(self.num_users, 4), dtype=np.float32
         )
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.current_step = 0
+        self.abusive_counters = np.zeros(self.num_users)
         return self._get_state(), {}
 
     def _get_state(self):
         """
-        Get the current state, with requested bandwidth and initial allocations.
+        Get the current state, with requested bandwidth, initial allocations, and abusive usage indicators.
         """
         unique_dates = self.data["Date"].unique()
 
@@ -42,13 +44,20 @@ class SimpleBandwidthEnv(gym.Env):
         current_data = self.data[self.data["Date"] == current_time].sort_values("DID")
         requested_bandwidths = current_data["BW_REQUESTED"].values
         initial_allocations = np.ones(self.num_users) * self.cir
-        state = np.column_stack((requested_bandwidths, initial_allocations))
+        abusive_usage = (self.abusive_counters > 3).astype(float)
+        time_of_day = datetime.strptime(str(current_time), '%Y-%m-%d %H:%M:%S').hour / 24.0
+        state = np.column_stack((requested_bandwidths, initial_allocations, abusive_usage, np.full(self.num_users, time_of_day)))
         return state
 
     def step(self, action):
-        # Clip action to ensure it respects CIR and total bandwidth constraints
-        allocated_bandwidth = np.clip(action, self.cir, self.total_bandwidth)
+        # Initial allocation phase (CIR)
         requested_bandwidths = self._get_state()[:, 0]
+        initial_allocations = np.minimum(requested_bandwidths, self.cir)
+        remaining_bandwidth = self.total_bandwidth - np.sum(initial_allocations)
+
+        # RL agent adjusts MIRs based on remaining bandwidth
+        mirs = np.clip(action, self.cir, remaining_bandwidth)
+        allocated_bandwidth = np.minimum(requested_bandwidths, mirs)
 
         # Calculate rewards based on efficiency and penalty for over-allocation
         efficiency_reward = (
@@ -61,7 +70,15 @@ class SimpleBandwidthEnv(gym.Env):
         over_allocation_penalty = (
             max(0, np.sum(allocated_bandwidth) - self.total_bandwidth) * -0.1
         )
-        reward = efficiency_reward + over_allocation_penalty
+
+        # Penalty for sustained abusive usage
+        abusive_penalty = -0.5 * np.sum(self.abusive_counters > 3) / self.num_users
+
+        reward = efficiency_reward + over_allocation_penalty + abusive_penalty
+
+        # Update abusive counters
+        self.abusive_counters[requested_bandwidths > mirs * 1.2] += 1
+        self.abusive_counters[requested_bandwidths <= mirs * 1.2] = 0
 
         # Advance to the next time step and check for end of data
         self.current_step += 1
@@ -69,6 +86,9 @@ class SimpleBandwidthEnv(gym.Env):
         truncated = False
 
         return self._get_state(), reward, done, truncated, {}
+
+    def render(self, mode='human'):
+        pass
 
 
 def preprocess_data(file_path):
